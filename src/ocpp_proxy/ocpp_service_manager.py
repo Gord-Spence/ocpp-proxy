@@ -10,6 +10,7 @@ else:
     Subprotocol = str
 
 from .charge_point_factory import OCPPServiceFactory
+from .proxy_session import forwarding_enabled
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +33,12 @@ class OCPPServiceManager:
         """Start connections to all configured OCPP services."""
         if not hasattr(self.config, "ocpp_services"):
             _LOGGER.info("No OCPP services configured")
+            return
+
+        if forwarding_enabled(self.config):
+            # Forwarding mode opens dedicated upstream sockets per charger session
+            # (see ProxySession); persistent startup connections would duplicate them.
+            _LOGGER.info("Forwarding mode enabled; upstream connections are per charger session")
             return
 
         for service_config in self.config.ocpp_services:
