@@ -12,20 +12,55 @@ from .config import Config
 from .ha_bridge import HABridge
 from .logger import EventLogger
 from .ocpp_service_manager import OCPPServiceManager
+from .proxy_session import (
+    ProxySession,
+    forwarding_enabled,
+    forwarding_services,
+    negotiate_subprotocol,
+    parse_requested_subprotocols,
+    subprotocol_to_version,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def charger_handler(request: web.Request) -> web.WebSocketResponse:
     """Handle WebSocket connection from the EV charger (CSMS role)."""
-    ws = web.WebSocketResponse()
+    # Negotiate the OCPP sub-protocol: chargers drop the connection if the server
+    # does not echo one of the protocols they offered in Sec-WebSocket-Protocol.
+    requested = parse_requested_subprotocols(request.headers.get("Sec-WebSocket-Protocol"))
+    subprotocol = negotiate_subprotocol(requested)
+    ws = web.WebSocketResponse(protocols=(subprotocol,) if subprotocol else ())
     await ws.prepare(request)
+    _LOGGER.info("Charger offered %s, negotiated %s", requested, ws.ws_protocol)
 
     config = request.app["config"]
+    cp_id = request.match_info.get("cp_id", "CP-1")
+
+    if forwarding_enabled(config):
+        primary, monitors = forwarding_services(config)
+        assert primary is not None
+        session = ProxySession(
+            cp_id, ws, ws.ws_protocol, primary, monitors, manager=request.app["backend_manager"]
+        )
+        request.app["charge_point"] = session
+        try:
+            await session.run()
+        except Exception:
+            _LOGGER.exception("Proxy session error")
+        finally:
+            if request.app.get("charge_point") is session:
+                request.app["charge_point"] = None
+            await session.close()
+        return ws
+
+    version = config.ocpp_version
+    if config.auto_detect_ocpp_version:
+        version = subprotocol_to_version(ws.ws_protocol) or version
     cp = ChargePointFactory.create_charge_point(
-        "CP-1",
+        cp_id,
         ws,
-        version=config.ocpp_version,
+        version=version,
         manager=request.app["backend_manager"],
         ha_bridge=request.app["ha_bridge"],
         event_logger=request.app["event_logger"],
@@ -202,6 +237,7 @@ async def init_app() -> web.Application:
         [
             web.get("/", welcome_handler),
             web.get("/charger", charger_handler),
+            web.get("/charger/{cp_id}", charger_handler),
             web.get("/backend", backend_handler),
             web.get("/sessions", sessions_json),
             web.get("/sessions.csv", sessions_csv),
